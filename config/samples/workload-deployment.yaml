@@ -1,0 +1,25 @@
+# Demo workload for klease. In the real demo (Phase 3) this is the vLLM
+# server contending for the GPU; on kind it can be any container.
+# The klease.zachallen.io/managed label is what the operator watches for
+# (invariant enforcement lands in Phase 2; Phase 1 scales it via workloadRef).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm-server
+  labels:
+    app.kubernetes.io/name: klease
+    app.kubernetes.io/managed-by: kustomize
+    klease.zachallen.io/managed: "true"
+spec:
+  replicas: 0 # managed by klease: no active lease -> replicas 0
+  selector:
+    matchLabels:
+      app: vllm-server
+  template:
+    metadata:
+      labels:
+        app: vllm-server
+    spec:
+      containers:
+        - name: placeholder
+          image: registry.k8s.io/pause:3.10

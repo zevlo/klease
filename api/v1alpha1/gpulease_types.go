@@ -74,6 +74,13 @@ const (
 	GPULeaseStateExpired GPULeaseState = "Expired"
 )
 
+// Condition types for GPULease.
+const (
+	// GPULeaseConditionWorkloadNotFound is True when the lease's workloadRef
+	// target does not exist. The lease holds Pending until it appears.
+	GPULeaseConditionWorkloadNotFound = "WorkloadNotFound"
+)
+
 // GPULeaseStatus defines the observed state of GPULease.
 type GPULeaseStatus struct {
 	// state is the current lifecycle phase: Pending, Active, Draining, or Expired.
