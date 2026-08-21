@@ -398,7 +398,9 @@ var _ = Describe("Manager", Ordered, func() {
 
 		It("holds a deleted holder until its workload drains, then releases it", func() {
 			By("deleting lease-b mid-slot")
-			_, err := kubectl("delete", "gpulease", leaseB, "-n", leaseNamespace)
+			// --wait=false: kubectl would otherwise block until the
+			// finalizer releases the object, hiding the drain window.
+			_, err := kubectl("delete", "gpulease", leaseB, "-n", leaseNamespace, "--wait=false")
 			Expect(err).NotTo(HaveOccurred(), "Failed to delete lease-b")
 
 			By("the object persists in Draining under the finalizer while its pod terminates")
