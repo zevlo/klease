@@ -193,6 +193,71 @@ var _ = Describe("computeQueue", func() {
 		})
 	})
 
+	Context("timer derivation", func() {
+		It("extends a live Active lease's expiry when spec.duration grows", func() {
+			a := active(lease("a", "default", 0, nil), base.Add(-10*time.Minute))
+			oldExpiry := a.Status.ExpiresAt.Time
+			a.Spec.Duration = metav1.Duration{Duration: time.Hour}
+
+			res := computeQueue([]*kleasev1alpha1.GPULease{a}, base, alwaysAdmissible)
+
+			Expect(a.Status.State).To(Equal(kleasev1alpha1.GPULeaseStateActive))
+			Expect(a.Status.ExpiresAt.Time).To(Equal(a.Status.ActiveSince.Add(time.Hour)))
+			t := findTransition(res, TransitionAdjusted)
+			Expect(t).NotTo(BeNil())
+			Expect(t.Lease).To(BeIdenticalTo(a))
+			Expect(t.Message).To(ContainSubstring("expiresAt"))
+			Expect(oldExpiry).NotTo(Equal(a.Status.ExpiresAt.Time))
+		})
+
+		It("shortens a live Active lease's expiry and drains it when the new expiry has passed", func() {
+			a := active(lease("a", "default", 0, nil), base.Add(-29*time.Minute))
+			a.Spec.Duration = metav1.Duration{Duration: 15 * time.Minute}
+
+			res := computeQueue([]*kleasev1alpha1.GPULease{a}, base, alwaysAdmissible)
+
+			Expect(a.Status.State).To(Equal(kleasev1alpha1.GPULeaseStateDraining))
+			Expect(a.Status.DrainDeadline.Time).To(Equal(a.Status.ExpiresAt.Add(5 * time.Minute)))
+			Expect(findTransition(res, TransitionAdjusted)).NotTo(BeNil())
+			Expect(findTransition(res, TransitionDraining)).NotTo(BeNil())
+		})
+
+		It("moves a live drain's deadline when spec.gracePeriod changes", func() {
+			a := active(lease("a", "default", 0, nil), base.Add(-31*time.Minute))
+			computeQueue([]*kleasev1alpha1.GPULease{a}, base, alwaysAdmissible) // -> Draining, 5m default deadline
+			Expect(a.Status.State).To(Equal(kleasev1alpha1.GPULeaseStateDraining))
+
+			a.Spec.GracePeriod = &metav1.Duration{Duration: 10 * time.Minute}
+			res := computeQueue([]*kleasev1alpha1.GPULease{a}, base, alwaysAdmissible)
+
+			Expect(a.Status.DrainDeadline.Time).To(Equal(a.Status.ExpiresAt.Add(10 * time.Minute)))
+			t := findTransition(res, TransitionAdjusted)
+			Expect(t).NotTo(BeNil())
+			Expect(t.Message).To(ContainSubstring("drainDeadline"))
+		})
+
+		It("repairs an Active lease missing expiresAt without an Adjusted event", func() {
+			a := active(lease("a", "default", 0, nil), base.Add(-5*time.Minute))
+			a.Status.ExpiresAt = nil
+
+			res := computeQueue([]*kleasev1alpha1.GPULease{a}, base, alwaysAdmissible)
+
+			Expect(a.Status.ExpiresAt.Time).To(Equal(a.Status.ActiveSince.Add(30 * time.Minute)))
+			Expect(findTransition(res, TransitionAdjusted)).To(BeNil())
+			Expect(res.Changed).To(HaveLen(1))
+		})
+
+		It("is a no-op for a lease whose timers already match spec", func() {
+			a := active(lease("a", "default", 0, nil), base.Add(-5*time.Minute))
+			a.Status.QueuePosition = 0
+
+			res := computeQueue([]*kleasev1alpha1.GPULease{a}, base, alwaysAdmissible)
+
+			Expect(res.Changed).To(BeEmpty())
+			Expect(res.Transitions).To(BeEmpty())
+		})
+	})
+
 	Context("split-brain resolution", func() {
 		It("keeps the earliest activeSince and demotes the rest", func() {
 			a := active(lease("a", "default", 0, nil), base.Add(-2*time.Minute))

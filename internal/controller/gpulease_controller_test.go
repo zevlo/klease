@@ -23,6 +23,7 @@ import (
 	. "github.com/onsi/gomega"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -179,6 +180,48 @@ var _ = Describe("GPULease Controller", func() {
 
 			Expect(getLease(leaseName).Status.State).To(Equal(kleasev1alpha1.GPULeaseStateExpired))
 			Expect(result.RequeueAfter).To(Equal(time.Duration(0))) // nothing queued, draining, or active
+		})
+	})
+
+	Context("spec mutation on a live lease", func() {
+		const (
+			leaseName = "mutable-lease"
+			deploy    = "mutable-deploy"
+		)
+
+		BeforeEach(func() {
+			Expect(k8sClient.Create(ctx, makeLease(leaseName, deploy, 30*time.Minute))).To(Succeed())
+			Expect(k8sClient.Create(ctx, makeDeployment(deploy, 0, true))).To(Succeed())
+			doReconcile(leaseName) // admits
+			Expect(getLease(leaseName).Status.State).To(Equal(kleasev1alpha1.GPULeaseStateActive))
+		})
+
+		AfterEach(func() {
+			Expect(k8sClient.Delete(ctx, getLease(leaseName))).To(Succeed())
+			Expect(k8sClient.Delete(ctx, getDeploy(deploy))).To(Succeed())
+		})
+
+		It("rejects workloadRef mutation at the API server", func() {
+			l := getLease(leaseName)
+			l.Spec.WorkloadRef.Name = "some-other-deploy"
+			err := k8sClient.Update(ctx, l)
+
+			Expect(err).To(HaveOccurred())
+			Expect(apierrors.IsInvalid(err)).To(BeTrue())
+			Expect(err.Error()).To(ContainSubstring("workloadRef is immutable"))
+		})
+
+		It("extends the live expiry when spec.duration grows", func() {
+			l := getLease(leaseName)
+			l.Spec.Duration = metav1.Duration{Duration: time.Hour}
+			Expect(k8sClient.Update(ctx, l)).To(Succeed())
+
+			doReconcile(leaseName)
+
+			l = getLease(leaseName)
+			Expect(l.Status.State).To(Equal(kleasev1alpha1.GPULeaseStateActive))
+			Expect(l.Status.ExpiresAt.Time).To(Equal(l.Status.ActiveSince.Add(time.Hour)))
+			Expect(replicas(deploy)).To(Equal(int32(1))) // still the holder
 		})
 	})
 
@@ -386,6 +429,13 @@ var _ = Describe("GPULease Controller", func() {
 			_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: key("any-lease")})
 			Expect(err).NotTo(HaveOccurred())
 			Expect(replicas(deploy)).To(Equal(int32(0)))
+		})
+
+		It("maps managed Deployment events to the synthetic queue key when no leases exist", func() {
+			reqs := r.leasesForManagedDeployment(ctx, getDeploy(deploy))
+
+			Expect(reqs).To(HaveLen(1))
+			Expect(reqs[0].NamespacedName).To(Equal(drainQueueKey))
 		})
 	})
 })

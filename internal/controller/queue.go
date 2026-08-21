@@ -33,6 +33,7 @@ const (
 	TransitionDraining = "Draining"
 	TransitionExpired  = "Expired"
 	TransitionDemoted  = "Demoted"
+	TransitionAdjusted = "Adjusted"
 )
 
 // defaultGracePeriod mirrors the CEL default on spec.gracePeriod; it backs
@@ -60,6 +61,10 @@ type QueueResult struct {
 
 // computeQueue runs the pure scheduling pass over all leases:
 //
+//  0. Derivation: Active and Draining leases have their timers re-derived
+//     from spec every pass — spec.duration edits extend or shorten a live
+//     lease's expiresAt, gracePeriod edits move a live drain's deadline,
+//     and corrupted status self-heals.
 //  1. Expiry: Active leases at or past expiresAt become Draining, with
 //     drainDeadline = expiresAt + gracePeriod stamped for the reclaim.
 //  2. Single-active: if multiple leases are Active (split brain), the
@@ -88,6 +93,46 @@ func computeQueue(leases []*kleasev1alpha1.GPULease, now time.Time, admissible f
 	}
 	transition := func(l *kleasev1alpha1.GPULease, kind, message string) {
 		result.Transitions = append(result.Transitions, Transition{Lease: l, Kind: kind, Message: message})
+	}
+	adjust := func(l *kleasev1alpha1.GPULease, field string, from, to time.Time) {
+		changed(l)
+		transition(l, TransitionAdjusted,
+			fmt.Sprintf("%s adjusted from %s to %s by spec change or repair",
+				field, from.UTC().Format(time.RFC3339), to.UTC().Format(time.RFC3339)))
+	}
+
+	// Pass 0: derivation. Timers are derived state, not write-once stamps:
+	// every pass recomputes them from spec so edits to a live lease take
+	// effect and corrupted status heals.
+	for _, l := range leases {
+		switch l.Status.State {
+		case kleasev1alpha1.GPULeaseStateActive:
+			if l.Status.ActiveSince == nil {
+				continue // admission stamps it; nothing to derive from yet
+			}
+			want := metav1.NewTime(l.Status.ActiveSince.Add(l.Spec.Duration.Duration))
+			if l.Status.ExpiresAt == nil {
+				l.Status.ExpiresAt = &want
+				changed(l) // repair, not an adjustment: nothing to move from
+			} else if !want.Time.Equal(l.Status.ExpiresAt.Time) {
+				from := l.Status.ExpiresAt.Time
+				adjust(l, "expiresAt", from, want.Time)
+				l.Status.ExpiresAt = &want
+			}
+		case kleasev1alpha1.GPULeaseStateDraining:
+			if l.Status.ExpiresAt == nil {
+				continue
+			}
+			want := metav1.NewTime(l.Status.ExpiresAt.Add(gracePeriodOf(l)))
+			if l.Status.DrainDeadline == nil {
+				l.Status.DrainDeadline = &want
+				changed(l)
+			} else if !want.Time.Equal(l.Status.DrainDeadline.Time) {
+				from := l.Status.DrainDeadline.Time
+				adjust(l, "drainDeadline", from, want.Time)
+				l.Status.DrainDeadline = &want
+			}
+		}
 	}
 
 	// Pass 1: expiry. The holder keeps the GPU until its workload is

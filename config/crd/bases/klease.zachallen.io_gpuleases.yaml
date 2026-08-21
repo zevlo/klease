@@ -82,6 +82,8 @@ spec:
                 description: |-
                   workloadRef identifies the workload that holds the GPU while this lease
                   is Active. It must live in the same namespace as the lease.
+                  Changing what a lease points at would hand the GPU to a different
+                  workload without a drain, so it is immutable: create a new lease.
                 properties:
                   kind:
                     description: kind of the workload. Only Deployment is supported
@@ -99,6 +101,9 @@ spec:
                 - kind
                 - name
                 type: object
+                x-kubernetes-validations:
+                - message: workloadRef is immutable
+                  rule: self == oldSelf
             required:
             - duration
             - workloadRef

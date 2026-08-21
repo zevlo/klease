@@ -339,16 +339,24 @@ func (r *GPULeaseReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Complete(r)
 }
 
+// drainQueueKey is a synthetic reconcile key used when a managed
+// Deployment event fires with no leases in the cluster: reconciliation is
+// a global pass over all leases, so any key drives the same invariant
+// enforcement and drift is corrected immediately.
+var drainQueueKey = types.NamespacedName{Namespace: "klease", Name: "queue"}
+
 // leasesForManagedDeployment enqueues every lease on any managed Deployment
 // event. Reconciliation is a global pass, so any lease key drives the same
 // invariant enforcement — this catches drift on managed workloads even when
-// the drifted Deployment is referenced by no lease. Known v0.1 limit: if no
-// leases exist at all, there is no key to enqueue and drift waits for the
-// first lease event.
+// the drifted Deployment is referenced by no lease. With no leases at all,
+// a synthetic key drives the pass anyway so the invariant still holds.
 func (r *GPULeaseReconciler) leasesForManagedDeployment(ctx context.Context, obj client.Object) []reconcile.Request {
 	leaseList := &kleasev1alpha1.GPULeaseList{}
 	if err := r.List(ctx, leaseList); err != nil {
 		return nil
+	}
+	if len(leaseList.Items) == 0 {
+		return []reconcile.Request{{NamespacedName: drainQueueKey}}
 	}
 	reqs := make([]reconcile.Request, 0, len(leaseList.Items))
 	for i := range leaseList.Items {

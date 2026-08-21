@@ -31,6 +31,9 @@ import (
 type GPULeaseSpec struct {
 	// workloadRef identifies the workload that holds the GPU while this lease
 	// is Active. It must live in the same namespace as the lease.
+	// Changing what a lease points at would hand the GPU to a different
+	// workload without a drain, so it is immutable: create a new lease.
+	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="workloadRef is immutable"
 	WorkloadRef WorkloadRef `json:"workloadRef"`
 
 	// duration is how long the lease holds the GPU once admitted. The timer
