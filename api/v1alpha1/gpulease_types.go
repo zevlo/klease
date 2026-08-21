@@ -77,9 +77,15 @@ const (
 // Condition types for GPULease.
 const (
 	// GPULeaseConditionWorkloadNotFound is True when the lease's workloadRef
-	// target does not exist. The lease holds Pending until it appears.
+	// target does not exist (or is not opted in to klease). The lease holds
+	// Pending until the target is admissible.
 	GPULeaseConditionWorkloadNotFound = "WorkloadNotFound"
 )
+
+// ManagedLabelKey is the label that opts a workload into klease arbitration.
+// Workloads carrying this label obey the invariant: no active lease
+// referencing them -> replicas 0.
+const ManagedLabelKey = "klease.zachallen.io/managed"
 
 // GPULeaseStatus defines the observed state of GPULease.
 type GPULeaseStatus struct {
