@@ -364,7 +364,9 @@ var _ = Describe("Manager", Ordered, func() {
 				g.Expect(leaseState(leaseB)).To(Equal(statePending))
 				pos, err := kubectl("get", "gpulease", leaseB, "-n", leaseNamespace, "-o=jsonpath={.status.queuePosition}")
 				g.Expect(err).NotTo(HaveOccurred())
-				g.Expect(strings.TrimSpace(pos)).To(Equal("0"))
+				// queuePosition is omitempty in the API: the head's 0
+				// serializes as absent, so accept empty as well as "0".
+				g.Expect(strings.TrimSpace(pos)).To(SatisfyAny(Equal("0"), BeEmpty()))
 				g.Expect(deploymentReplicas(workloadB)).To(Equal("0"))
 			}, eventuallyTimeout, eventuallyPolling).Should(Succeed())
 		})
