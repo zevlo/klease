@@ -1,0 +1,13 @@
+# Second lease: queued behind lease-a; admitted only after lease-a's
+# workload has fully drained (strict handoff).
+apiVersion: klease.zachallen.io/v1alpha1
+kind: GPULease
+metadata:
+  name: lease-b
+  namespace: klease-e2e
+spec:
+  workloadRef:
+    kind: Deployment
+    name: workload-b
+  duration: 90s
+  gracePeriod: 30s

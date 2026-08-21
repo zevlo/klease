@@ -1,0 +1,73 @@
+# Fixtures for the klease e2e lifecycle specs: a dedicated namespace with
+# two managed workloads contending for the GPU. klease drives replicas
+# between 0 and 1 as leases are admitted; both start parked at 0.
+#
+# The pods ignore SIGTERM (trap '') with a 15s termination grace period,
+# so every drain takes ~15s — a deterministic window in which the Draining
+# state and the strict-handoff block are observable.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: klease-e2e
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: workload-a
+  namespace: klease-e2e
+  labels:
+    klease.zachallen.io/managed: "true"
+spec:
+  replicas: 0 # managed by klease: no active lease -> replicas 0
+  selector:
+    matchLabels:
+      app: workload-a
+  template:
+    metadata:
+      labels:
+        app: workload-a
+    spec:
+      terminationGracePeriodSeconds: 15
+      containers:
+        - name: holder
+          image: busybox:1.36
+          command: ["sh", "-c", "trap '' TERM; while true; do sleep 5; done"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            runAsNonRoot: true
+            runAsUser: 1000
+            seccompProfile:
+              type: RuntimeDefault
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: workload-b
+  namespace: klease-e2e
+  labels:
+    klease.zachallen.io/managed: "true"
+spec:
+  replicas: 0 # managed by klease: no active lease -> replicas 0
+  selector:
+    matchLabels:
+      app: workload-b
+  template:
+    metadata:
+      labels:
+        app: workload-b
+    spec:
+      terminationGracePeriodSeconds: 15
+      containers:
+        - name: holder
+          image: busybox:1.36
+          command: ["sh", "-c", "trap '' TERM; while true; do sleep 5; done"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            runAsNonRoot: true
+            runAsUser: 1000
+            seccompProfile:
+              type: RuntimeDefault

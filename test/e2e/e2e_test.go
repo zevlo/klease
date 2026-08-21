@@ -25,6 +25,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -279,6 +280,142 @@ var _ = Describe("Manager", Ordered, func() {
 		//    fmt.Sprintf(`controller_runtime_reconcile_total{controller="%s",result="success"} 1`,
 		//    strings.ToLower(<Kind>),
 		// ))
+	})
+
+	// The lifecycle specs validate the full GPULease state machine against
+	// a real kubelet: pods are created by the Deployment controller and
+	// terminate on their own grace period (they ignore SIGTERM for ~15s),
+	// so admission, drain, and strict handoff are observed end-to-end.
+	Context("GPULease lifecycle", func() {
+		const (
+			leaseNamespace    = "klease-e2e"
+			leaseA            = "lease-a"
+			leaseB            = "lease-b"
+			workloadA         = "workload-a"
+			workloadB         = "workload-b"
+			stateActive       = "Active"
+			statePending      = "Pending"
+			stateDraining     = "Draining"
+			stateExpired      = "Expired"
+			workloadsManifest = "test/e2e/testdata/workloads.yaml"
+			leaseAManifest    = "test/e2e/testdata/lease-a.yaml"
+			leaseBManifest    = "test/e2e/testdata/lease-b.yaml"
+			eventuallyTimeout = 3 * time.Minute
+			eventuallyPolling = 2 * time.Second
+			replicaJSONPath   = "-o=jsonpath={.spec.replicas}"
+			deletionJSONPath  = "-o=jsonpath={.metadata.deletionTimestamp}"
+			podPhaseTemplate  = "-o=go-template={{range .items}}{{.status.phase}}{{end}}"
+			podCountTemplate  = "-o=go-template={{len .items}}"
+		)
+
+		kubectl := func(args ...string) (string, error) {
+			return utils.Run(exec.Command("kubectl", args...))
+		}
+		leaseState := func(name string) string {
+			out, _ := kubectl("get", "gpulease", name, "-n", leaseNamespace, "-o=jsonpath={.status.state}")
+			return strings.TrimSpace(out)
+		}
+		deploymentReplicas := func(name string) string {
+			out, _ := kubectl("get", "deployment", name, "-n", leaseNamespace, replicaJSONPath)
+			return strings.TrimSpace(out)
+		}
+		podPhase := func(workload string) string {
+			out, _ := kubectl("get", "pods", "-n", leaseNamespace, "-l", "app="+workload, podPhaseTemplate)
+			return strings.TrimSpace(out)
+		}
+		podCount := func(workload string) string {
+			out, _ := kubectl("get", "pods", "-n", leaseNamespace, "-l", "app="+workload, podCountTemplate)
+			return strings.TrimSpace(out)
+		}
+
+		BeforeAll(func() {
+			By("applying the managed workloads")
+			_, err := kubectl("apply", "-f", workloadsManifest)
+			Expect(err).NotTo(HaveOccurred(), "Failed to apply e2e workloads")
+
+			By("waiting for both Deployments to be observed")
+			for _, name := range []string{workloadA, workloadB} {
+				Eventually(func(g Gomega) {
+					out, err := kubectl("get", "deployment", name, "-n", leaseNamespace)
+					g.Expect(err).NotTo(HaveOccurred())
+					g.Expect(out).To(ContainSubstring(name))
+				}, eventuallyTimeout, eventuallyPolling).Should(Succeed())
+			}
+		})
+
+		AfterAll(func() {
+			By("removing the e2e fixtures namespace")
+			_, _ = kubectl("delete", "namespace", leaseNamespace, "--ignore-not-found")
+		})
+
+		It("admits the first lease, runs one pod, and queues the second", func() {
+			By("creating lease-a; it is admitted immediately and scales workload-a to 1")
+			_, err := kubectl("apply", "-f", leaseAManifest)
+			Expect(err).NotTo(HaveOccurred(), "Failed to apply lease-a")
+			Eventually(func(g Gomega) {
+				g.Expect(leaseState(leaseA)).To(Equal(stateActive))
+				g.Expect(deploymentReplicas(workloadA)).To(Equal("1"))
+			}, eventuallyTimeout, eventuallyPolling).Should(Succeed())
+
+			By("creating lease-b; it queues at position 0 while workload-b stays at 0")
+			_, err = kubectl("apply", "-f", leaseBManifest)
+			Expect(err).NotTo(HaveOccurred(), "Failed to apply lease-b")
+			Eventually(func(g Gomega) {
+				g.Expect(leaseState(leaseB)).To(Equal(statePending))
+				pos, err := kubectl("get", "gpulease", leaseB, "-n", leaseNamespace, "-o=jsonpath={.status.queuePosition}")
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(strings.TrimSpace(pos)).To(Equal("0"))
+				g.Expect(deploymentReplicas(workloadB)).To(Equal("0"))
+			}, eventuallyTimeout, eventuallyPolling).Should(Succeed())
+		})
+
+		It("drains the holder at expiry and admits the successor only after the drain completes", func() {
+			By("waiting for the holder's pod to run")
+			Eventually(func(g Gomega) {
+				g.Expect(podPhase(workloadA)).To(Equal("Running"))
+			}, eventuallyTimeout, eventuallyPolling).Should(Succeed())
+
+			By("observing the strict handoff: lease-a Draining, workload-a at 0, lease-b still Pending")
+			// The pod ignores SIGTERM for ~15s, so this window is stable
+			// enough to sample all three facts in one pass.
+			Eventually(func(g Gomega) {
+				g.Expect(leaseState(leaseA)).To(Equal(stateDraining))
+				g.Expect(leaseState(leaseB)).To(Equal(statePending))
+				g.Expect(deploymentReplicas(workloadA)).To(Equal("0"))
+			}, eventuallyTimeout, eventuallyPolling).Should(Succeed())
+
+			By("after the drain: lease-a Expired, lease-b Active, workload-b runs the pod")
+			Eventually(func(g Gomega) {
+				g.Expect(leaseState(leaseA)).To(Equal(stateExpired))
+				g.Expect(leaseState(leaseB)).To(Equal(stateActive))
+				g.Expect(deploymentReplicas(workloadB)).To(Equal("1"))
+				g.Expect(podPhase(workloadB)).To(Equal("Running"))
+				g.Expect(podCount(workloadA)).To(Equal("0"))
+			}, eventuallyTimeout, eventuallyPolling).Should(Succeed())
+		})
+
+		It("holds a deleted holder until its workload drains, then releases it", func() {
+			By("deleting lease-b mid-slot")
+			_, err := kubectl("delete", "gpulease", leaseB, "-n", leaseNamespace)
+			Expect(err).NotTo(HaveOccurred(), "Failed to delete lease-b")
+
+			By("the object persists in Draining under the finalizer while its pod terminates")
+			Eventually(func(g Gomega) {
+				delTs, err := kubectl("get", "gpulease", leaseB, "-n", leaseNamespace, deletionJSONPath)
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(strings.TrimSpace(delTs)).NotTo(BeEmpty())
+				g.Expect(leaseState(leaseB)).To(Equal(stateDraining))
+				g.Expect(deploymentReplicas(workloadB)).To(Equal("0"))
+			}, eventuallyTimeout, eventuallyPolling).Should(Succeed())
+
+			By("once drained, the object is released and the workload stays parked")
+			Eventually(func(g Gomega) {
+				_, err := kubectl("get", "gpulease", leaseB, "-n", leaseNamespace)
+				g.Expect(err).To(HaveOccurred(), "lease-b should be gone once the drain completes")
+				g.Expect(deploymentReplicas(workloadB)).To(Equal("0"))
+				g.Expect(podCount(workloadB)).To(Equal("0"))
+			}, eventuallyTimeout, eventuallyPolling).Should(Succeed())
+		})
 	})
 })
 

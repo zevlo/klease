@@ -1,0 +1,12 @@
+# First lease: admitted immediately, holds the GPU for 90s.
+apiVersion: klease.zachallen.io/v1alpha1
+kind: GPULease
+metadata:
+  name: lease-a
+  namespace: klease-e2e
+spec:
+  workloadRef:
+    kind: Deployment
+    name: workload-a
+  duration: 90s
+  gracePeriod: 30s
