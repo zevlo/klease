@@ -18,7 +18,8 @@ package controller
 
 import (
 	"fmt"
-	"sort"
+	"slices"
+	"strings"
 	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -167,8 +168,8 @@ func computeQueue(leases []*kleasev1alpha1.GPULease, now time.Time, admissible f
 		}
 	}
 	if len(actives) > 1 {
-		sort.Slice(actives, func(i, j int) bool {
-			return activeRank(actives[i]).Before(activeRank(actives[j]))
+		slices.SortFunc(actives, func(a, b *kleasev1alpha1.GPULease) int {
+			return activeRank(a).Compare(activeRank(b))
 		})
 		for _, l := range actives[1:] {
 			l.Status.State = kleasev1alpha1.GPULeaseStatePending
@@ -231,21 +232,20 @@ func pendingLeases(leases []*kleasev1alpha1.GPULease) []*kleasev1alpha1.GPULease
 			pending = append(pending, l)
 		}
 	}
-	sort.Slice(pending, func(i, j int) bool { return fifoLess(pending[i], pending[j]) })
+	slices.SortFunc(pending, fifoCompare)
 	return pending
 }
 
-// fifoLess ranks leases by creationTimestamp, then namespace, then name —
-// a deterministic total order.
-func fifoLess(a, b *kleasev1alpha1.GPULease) bool {
-	at, bt := a.CreationTimestamp.Time, b.CreationTimestamp.Time
-	if !at.Equal(bt) {
-		return at.Before(bt)
+// fifoCompare ranks leases by creationTimestamp, then namespace, then
+// name — a deterministic total order. Negative when a sorts before b.
+func fifoCompare(a, b *kleasev1alpha1.GPULease) int {
+	if c := a.CreationTimestamp.Compare(b.CreationTimestamp.Time); c != 0 {
+		return c
 	}
-	if a.Namespace != b.Namespace {
-		return a.Namespace < b.Namespace
+	if c := strings.Compare(a.Namespace, b.Namespace); c != 0 {
+		return c
 	}
-	return a.Name < b.Name
+	return strings.Compare(a.Name, b.Name)
 }
 
 // activeRank orders Active leases for split-brain resolution. Earliest

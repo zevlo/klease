@@ -34,6 +34,13 @@ import (
 	kleasev1alpha1 "github.com/zevlo/klease/api/v1alpha1"
 )
 
+const (
+	// testNamespace hosts all fixtures; leases and workloads colocate here.
+	testNamespace = "default"
+	// appLabelKey is the selector label shared by test workloads.
+	appLabelKey = "app"
+)
+
 var _ = Describe("GPULease Controller", func() {
 	var (
 		r        *GPULeaseReconciler
@@ -42,26 +49,26 @@ var _ = Describe("GPULease Controller", func() {
 
 	makeLease := func(name, deployName string, duration time.Duration) *kleasev1alpha1.GPULease {
 		return &kleasev1alpha1.GPULease{
-			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default"},
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: testNamespace},
 			Spec: kleasev1alpha1.GPULeaseSpec{
-				WorkloadRef: kleasev1alpha1.WorkloadRef{Kind: "Deployment", Name: deployName},
+				WorkloadRef: kleasev1alpha1.WorkloadRef{Kind: kleasev1alpha1.KindDeployment, Name: deployName},
 				Duration:    metav1.Duration{Duration: duration},
 			},
 		}
 	}
 
 	makeDeployment := func(name string, replicas int32, managed bool) *appsv1.Deployment {
-		labels := map[string]string{"app": name}
+		labels := map[string]string{appLabelKey: name}
 		if managed {
-			labels[kleasev1alpha1.ManagedLabelKey] = "true"
+			labels[kleasev1alpha1.ManagedLabelKey] = kleasev1alpha1.ManagedLabelValue
 		}
 		return &appsv1.Deployment{
-			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default", Labels: labels},
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: testNamespace, Labels: labels},
 			Spec: appsv1.DeploymentSpec{
 				Replicas: &replicas,
-				Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": name}},
+				Selector: &metav1.LabelSelector{MatchLabels: map[string]string{appLabelKey: name}},
 				Template: corev1.PodTemplateSpec{
-					ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app": name}},
+					ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{appLabelKey: name}},
 					Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "c", Image: "registry.k8s.io/pause:3.10"}}},
 				},
 			},
@@ -69,12 +76,12 @@ var _ = Describe("GPULease Controller", func() {
 	}
 
 	key := func(name string) types.NamespacedName {
-		return types.NamespacedName{Name: name, Namespace: "default"}
+		return types.NamespacedName{Name: name, Namespace: testNamespace}
 	}
 
 	makePod := func(name, deployName string) *corev1.Pod {
 		return &corev1.Pod{
-			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default", Labels: map[string]string{"app": deployName}},
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: testNamespace, Labels: map[string]string{appLabelKey: deployName}},
 			Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "c", Image: "registry.k8s.io/pause:3.10"}}},
 		}
 	}
@@ -182,7 +189,7 @@ var _ = Describe("GPULease Controller", func() {
 		AfterEach(func() {
 			Expect(k8sClient.Delete(ctx, getLease(leaseName))).To(Succeed())
 			// By reference: the test may have deleted it already.
-			_ = k8sClient.Delete(ctx, &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: deploy, Namespace: "default"}})
+			_ = k8sClient.Delete(ctx, &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: deploy, Namespace: testNamespace}})
 		})
 
 		It("completes the drain immediately when the workload no longer exists", func() {
@@ -266,8 +273,8 @@ var _ = Describe("GPULease Controller", func() {
 		AfterEach(func() {
 			deleteLeaseNow(holder)
 			deleteLeaseNow(successor)
-			_ = k8sClient.Delete(ctx, &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: depA, Namespace: "default"}})
-			_ = k8sClient.Delete(ctx, &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: depB, Namespace: "default"}})
+			_ = k8sClient.Delete(ctx, &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: depA, Namespace: testNamespace}})
+			_ = k8sClient.Delete(ctx, &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: depB, Namespace: testNamespace}})
 		})
 
 		It("carries the drain finalizer while holding the GPU", func() {

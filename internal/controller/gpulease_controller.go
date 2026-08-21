@@ -90,7 +90,7 @@ type GPULeaseReconciler struct {
 // poll capped by its drain deadline; Pending leases requeue on a safety-net
 // cadence so promotion never waits on an external event.
 func (r *GPULeaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	log := log.FromContext(ctx).WithValues("gpulease", req.NamespacedName)
+	logger := log.FromContext(ctx).WithValues("gpulease", req.NamespacedName)
 	now := r.now()
 
 	// The queue spans namespaces: every pass sees every lease.
@@ -141,7 +141,7 @@ func (r *GPULeaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		}
 	}
 	for _, t := range result.Transitions {
-		log.Info("lease transition", "lease", types.NamespacedName{Namespace: t.Lease.Namespace, Name: t.Lease.Name}, "kind", t.Kind)
+		logger.Info("lease transition", "lease", types.NamespacedName{Namespace: t.Lease.Namespace, Name: t.Lease.Name}, "kind", t.Kind)
 		r.Recorder.Event(t.Lease, "Normal", t.Kind, t.Message)
 	}
 
@@ -260,14 +260,14 @@ func (r *GPULeaseReconciler) maintainWorkloadConditions(ctx context.Context, lea
 // is visible in events.
 func (r *GPULeaseReconciler) enforceInvariant(ctx context.Context, active *kleasev1alpha1.GPULease) error {
 	managed := &appsv1.DeploymentList{}
-	if err := r.List(ctx, managed, client.MatchingLabels{kleasev1alpha1.ManagedLabelKey: "true"}); err != nil {
+	if err := r.List(ctx, managed, client.MatchingLabels{kleasev1alpha1.ManagedLabelKey: kleasev1alpha1.ManagedLabelValue}); err != nil {
 		return err
 	}
 	for i := range managed.Items {
 		deploy := &managed.Items[i]
 		want := int32(0)
 		holder := active != nil &&
-			active.Spec.WorkloadRef.Kind == "Deployment" &&
+			active.Spec.WorkloadRef.Kind == kleasev1alpha1.KindDeployment &&
 			active.Spec.WorkloadRef.Name == deploy.Name &&
 			active.Namespace == deploy.Namespace
 		if holder {
@@ -421,7 +421,7 @@ func (r *GPULeaseReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Watches(&appsv1.Deployment{},
 			handler.EnqueueRequestsFromMapFunc(r.leasesForManagedDeployment),
 			builder.WithPredicates(predicate.NewPredicateFuncs(func(o client.Object) bool {
-				return o.GetLabels()[kleasev1alpha1.ManagedLabelKey] == "true"
+				return o.GetLabels()[kleasev1alpha1.ManagedLabelKey] == kleasev1alpha1.ManagedLabelValue
 			}))).
 		Named("gpulease").
 		Complete(r)

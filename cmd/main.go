@@ -179,9 +179,13 @@ func main() {
 	}
 
 	if err := (&controller.GPULeaseReconciler{
-		Client:   mgr.GetClient(),
-		Scheme:   mgr.GetScheme(),
-		Recorder: mgr.GetEventRecorderFor("klease"),
+		Client: mgr.GetClient(),
+		Scheme: mgr.GetScheme(),
+		// TODO: migrate to mgr.GetEventRecorder (events.k8s.io/v1 API) and
+		// update RBAC markers when the old events API is dropped.
+		// Deprecated API retained for now to keep the event RBAC and
+		// recorder fakes unchanged.
+		Recorder: mgr.GetEventRecorderFor("klease"), //nolint:staticcheck
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "gpulease")
 		os.Exit(1)

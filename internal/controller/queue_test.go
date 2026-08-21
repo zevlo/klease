@@ -42,7 +42,7 @@ var _ = Describe("computeQueue", func() {
 				CreationTimestamp: metav1.NewTime(base.Add(createdOffset)),
 			},
 			Spec: kleasev1alpha1.GPULeaseSpec{
-				WorkloadRef: kleasev1alpha1.WorkloadRef{Kind: "Deployment", Name: "w-" + name},
+				WorkloadRef: kleasev1alpha1.WorkloadRef{Kind: kleasev1alpha1.KindDeployment, Name: "w-" + name},
 				Duration:    metav1.Duration{Duration: 30 * time.Minute},
 			},
 		}

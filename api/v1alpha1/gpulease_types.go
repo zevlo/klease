@@ -92,6 +92,12 @@ const (
 // referencing them -> replicas 0.
 const ManagedLabelKey = "klease.zachallen.io/managed"
 
+// ManagedLabelValue is the value of ManagedLabelKey that opts a workload in.
+const ManagedLabelValue = "true"
+
+// KindDeployment is the only workload kind supported in v0.1.
+const KindDeployment = "Deployment"
+
 // FinalizerDrain holds deletion of a lease that may still own the GPU:
 // the object is removed only after its workload has been drained.
 const FinalizerDrain = "klease.zachallen.io/drain"
