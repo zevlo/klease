@@ -92,6 +92,10 @@ const (
 // referencing them -> replicas 0.
 const ManagedLabelKey = "klease.zachallen.io/managed"
 
+// FinalizerDrain holds deletion of a lease that may still own the GPU:
+// the object is removed only after its workload has been drained.
+const FinalizerDrain = "klease.zachallen.io/drain"
+
 // GPULeaseStatus defines the observed state of GPULease.
 type GPULeaseStatus struct {
 	// state is the current lifecycle phase: Pending, Active, Draining, or Expired.

@@ -28,6 +28,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	kleasev1alpha1 "github.com/zevlo/klease/api/v1alpha1"
@@ -98,6 +99,26 @@ var _ = Describe("GPULease Controller", func() {
 		ExpectWithOffset(1, err).NotTo(HaveOccurred())
 		return result
 	}
+	// deleteLeaseNow removes a lease without waiting for its drain: the
+	// finalizer is stripped so the object is reclaimed immediately. Test
+	// cleanup only — operators should let the controller drain.
+	deleteLeaseNow := func(name string) {
+		l := &kleasev1alpha1.GPULease{}
+		if err := k8sClient.Get(ctx, key(name), l); err != nil {
+			return // already gone
+		}
+		if l.DeletionTimestamp == nil {
+			ExpectWithOffset(1, k8sClient.Delete(ctx, l)).To(Succeed())
+			// A lease without the finalizer is reclaimed immediately; one
+			// with it lingers until the finalizer is stripped below.
+			if err := k8sClient.Get(ctx, key(name), l); err != nil {
+				return
+			}
+		}
+		if controllerutil.RemoveFinalizer(l, kleasev1alpha1.FinalizerDrain) {
+			ExpectWithOffset(1, k8sClient.Update(ctx, l)).To(Succeed())
+		}
+	}
 
 	BeforeEach(func() {
 		recorder = record.NewFakeRecorder(64)
@@ -120,7 +141,7 @@ var _ = Describe("GPULease Controller", func() {
 		})
 
 		AfterEach(func() {
-			Expect(k8sClient.Delete(ctx, getLease(leaseName))).To(Succeed())
+			deleteLeaseNow(leaseName)
 			Expect(k8sClient.Delete(ctx, getDeploy(deploy))).To(Succeed())
 		})
 
@@ -197,7 +218,7 @@ var _ = Describe("GPULease Controller", func() {
 		})
 
 		AfterEach(func() {
-			Expect(k8sClient.Delete(ctx, getLease(leaseName))).To(Succeed())
+			deleteLeaseNow(leaseName)
 			Expect(k8sClient.Delete(ctx, getDeploy(deploy))).To(Succeed())
 		})
 
@@ -222,6 +243,108 @@ var _ = Describe("GPULease Controller", func() {
 			Expect(l.Status.State).To(Equal(kleasev1alpha1.GPULeaseStateActive))
 			Expect(l.Status.ExpiresAt.Time).To(Equal(l.Status.ActiveSince.Add(time.Hour)))
 			Expect(replicas(deploy)).To(Equal(int32(1))) // still the holder
+		})
+	})
+
+	Context("lease deletion", func() {
+		const (
+			holder    = "del-holder"
+			successor = "del-successor"
+			depA      = "del-deploy-a"
+			depB      = "del-deploy-b"
+		)
+
+		BeforeEach(func() {
+			Expect(k8sClient.Create(ctx, makeLease(holder, depA, 30*time.Minute))).To(Succeed())
+			Expect(k8sClient.Create(ctx, makeDeployment(depA, 0, true))).To(Succeed())
+			Expect(k8sClient.Create(ctx, makeDeployment(depB, 0, true))).To(Succeed())
+			doReconcile(holder) // admits holder; the sweep stamps the finalizer
+			Expect(k8sClient.Create(ctx, makeLease(successor, depB, 30*time.Minute))).To(Succeed())
+			doReconcile(successor) // steady state: holder Active, successor queued
+		})
+
+		AfterEach(func() {
+			deleteLeaseNow(holder)
+			deleteLeaseNow(successor)
+			_ = k8sClient.Delete(ctx, &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: depA, Namespace: "default"}})
+			_ = k8sClient.Delete(ctx, &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: depB, Namespace: "default"}})
+		})
+
+		It("carries the drain finalizer while holding the GPU", func() {
+			Expect(getLease(holder).Finalizers).To(ContainElement(kleasev1alpha1.FinalizerDrain))
+		})
+
+		It("drains a deleted Active lease before releasing it and admitting the successor", func() {
+			fakeNow := time.Now()
+			r.NowFn = func() time.Time { return fakeNow }
+
+			pod := makePod("del-holder-pod", depA)
+			Expect(k8sClient.Create(ctx, pod)).To(Succeed())
+			DeferCleanup(func() { _ = k8sClient.Delete(ctx, pod) })
+
+			// Deleting the holder mid-slot: the finalizer holds the object.
+			Expect(k8sClient.Delete(ctx, getLease(holder))).To(Succeed())
+			doReconcile(successor)
+
+			h := getLease(holder) // still exists: finalizer holds it
+			Expect(h.DeletionTimestamp).NotTo(BeNil())
+			Expect(h.Status.State).To(Equal(kleasev1alpha1.GPULeaseStateDraining))
+			Expect(h.Status.DrainDeadline.Time).To(BeTemporally("~", fakeNow.Add(5*time.Minute), time.Second)) // grace runs from deletion
+			Expect(getLease(successor).Status.State).To(Equal(kleasev1alpha1.GPULeaseStatePending))
+			Expect(replicas(depA)).To(Equal(int32(0)))
+			Expect(replicas(depB)).To(Equal(int32(0)))
+
+			// The pod terminates: drain completes, the object is released,
+			// and the successor is admitted in the same pass.
+			Expect(k8sClient.Delete(ctx, pod)).To(Succeed())
+			doReconcile(successor)
+
+			err := k8sClient.Get(ctx, key(holder), &kleasev1alpha1.GPULease{})
+			Expect(apierrors.IsNotFound(err)).To(BeTrue())
+			Expect(getLease(successor).Status.State).To(Equal(kleasev1alpha1.GPULeaseStateActive))
+			Expect(replicas(depB)).To(Equal(int32(1)))
+		})
+
+		It("force-deletes a stuck pod of a deleted lease at the drain deadline", func() {
+			fakeNow := time.Now()
+			r.NowFn = func() time.Time { return fakeNow }
+
+			stuck := makePod("del-stuck-pod", depA)
+			Expect(k8sClient.Create(ctx, stuck)).To(Succeed())
+			DeferCleanup(func() { _ = k8sClient.Delete(ctx, stuck) })
+
+			Expect(k8sClient.Delete(ctx, getLease(holder))).To(Succeed())
+			doReconcile(successor)
+			Expect(getLease(holder).Status.State).To(Equal(kleasev1alpha1.GPULeaseStateDraining))
+
+			// Past the 5m drain deadline: the straggler is force-deleted.
+			fakeNow = fakeNow.Add(10 * time.Minute)
+			doReconcile(successor)
+			Expect(k8sClient.Get(ctx, key("del-stuck-pod"), &corev1.Pod{})).To(HaveOccurred())
+
+			// Deletion is confirmed on the next pass; then the successor runs.
+			doReconcile(successor)
+			Expect(apierrors.IsNotFound(k8sClient.Get(ctx, key(holder), &kleasev1alpha1.GPULease{}))).To(BeTrue())
+			Expect(getLease(successor).Status.State).To(Equal(kleasev1alpha1.GPULeaseStateActive))
+		})
+	})
+
+	Context("deletion of a Pending lease", func() {
+		const leaseName = "del-pending"
+
+		It("removes the object immediately without ever admitting it", func() {
+			Expect(k8sClient.Create(ctx, makeLease(leaseName, "never-created-deploy", 30*time.Minute))).To(Succeed())
+			doReconcile(leaseName) // Pending: workload missing, no finalizer
+
+			l := getLease(leaseName)
+			Expect(l.Status.State).To(Equal(kleasev1alpha1.GPULeaseStatePending))
+			Expect(l.Finalizers).To(BeEmpty())
+
+			Expect(k8sClient.Delete(ctx, l)).To(Succeed())
+			doReconcile(leaseName)
+
+			err := k8sClient.Get(ctx, key(leaseName), &kleasev1alpha1.GPULease{})
+			Expect(apierrors.IsNotFound(err)).To(BeTrue())
 		})
 	})
 
@@ -311,8 +434,8 @@ var _ = Describe("GPULease Controller", func() {
 		})
 
 		AfterEach(func() {
-			Expect(k8sClient.Delete(ctx, getLease(first))).To(Succeed())
-			Expect(k8sClient.Delete(ctx, getLease(second))).To(Succeed())
+			deleteLeaseNow(first)
+			deleteLeaseNow(second)
 			Expect(k8sClient.Delete(ctx, getDeploy(depA))).To(Succeed())
 			Expect(k8sClient.Delete(ctx, getDeploy(depB))).To(Succeed())
 		})

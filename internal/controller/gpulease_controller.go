@@ -32,6 +32,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
@@ -82,6 +83,8 @@ type GPULeaseReconciler struct {
 //   - Expired holders drain before the next lease is admitted: the lease
 //     goes Draining until its pods are gone (force-deleted at
 //     drainDeadline), then Expired hands the GPU to the queue head
+//   - Deleting a lease follows the same path: a holder's object is held
+//     by a finalizer until its workload is drained
 //
 // The Active lease requeues at its expiry; a Draining lease requeues on a
 // poll capped by its drain deadline; Pending leases requeue on a safety-net
@@ -105,14 +108,29 @@ func (r *GPULeaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		return ctrl.Result{}, err
 	}
 
+	// Deletion is expiry's twin: a deleting holder drains before the
+	// object is released.
+	if err := r.handleDeleting(ctx, leases, now); err != nil {
+		return ctrl.Result{}, err
+	}
+
 	// Finish drains first so a lease completing in this pass releases the
 	// GPU for admission below in the same reconcile.
 	if err := r.completeDrains(ctx, leases, now); err != nil {
 		return ctrl.Result{}, err
 	}
 
-	// Pure scheduling pass.
-	result := computeQueue(leases, now, func(l *kleasev1alpha1.GPULease) bool {
+	// Pure scheduling pass. Leases vanishing without the drain finalizer
+	// hold nothing: they are excluded so they cannot be admitted and hold
+	// no queue position.
+	queueInput := make([]*kleasev1alpha1.GPULease, 0, len(leases))
+	for _, l := range leases {
+		if l.DeletionTimestamp != nil && !controllerutil.ContainsFinalizer(l, kleasev1alpha1.FinalizerDrain) {
+			continue
+		}
+		queueInput = append(queueInput, l)
+	}
+	result := computeQueue(queueInput, now, func(l *kleasev1alpha1.GPULease) bool {
 		return !conditionTrue(l, kleasev1alpha1.GPULeaseConditionWorkloadNotFound)
 	})
 
@@ -125,6 +143,21 @@ func (r *GPULeaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	for _, t := range result.Transitions {
 		log.Info("lease transition", "lease", types.NamespacedName{Namespace: t.Lease.Namespace, Name: t.Lease.Name}, "kind", t.Kind)
 		r.Recorder.Event(t.Lease, "Normal", t.Kind, t.Message)
+	}
+
+	// Finalizer sweep: any lease that may hold the GPU carries the drain
+	// finalizer, so deletion cannot bypass the drain. Adding a finalizer
+	// to an object already deleting (a lost race) is still permitted, and
+	// the next pass drains it.
+	for _, l := range queueInput {
+		if l.Status.State != kleasev1alpha1.GPULeaseStateActive && l.Status.State != kleasev1alpha1.GPULeaseStateDraining {
+			continue
+		}
+		if controllerutil.AddFinalizer(l, kleasev1alpha1.FinalizerDrain) {
+			if err := r.Update(ctx, l); err != nil {
+				return ctrl.Result{}, err
+			}
+		}
 	}
 
 	// Level-triggered invariant enforcement across managed workloads.
@@ -172,7 +205,8 @@ func (r *GPULeaseReconciler) now() time.Time {
 // leaves the condition untouched for this pass.
 func (r *GPULeaseReconciler) maintainWorkloadConditions(ctx context.Context, leases []*kleasev1alpha1.GPULease) error {
 	for _, l := range leases {
-		if l.Status.State == kleasev1alpha1.GPULeaseStateExpired ||
+		if l.DeletionTimestamp != nil ||
+			l.Status.State == kleasev1alpha1.GPULeaseStateExpired ||
 			l.Status.State == kleasev1alpha1.GPULeaseStateDraining {
 			continue
 		}
@@ -258,6 +292,53 @@ func (r *GPULeaseReconciler) enforceInvariant(ctx context.Context, active *kleas
 	return nil
 }
 
+// handleDeleting gives deletion the same drain semantics as expiry: a
+// deleting lease that holds the GPU transitions to Draining and its object
+// is held by the finalizer until the drain completes. Deleting leases that
+// hold nothing are released immediately.
+func (r *GPULeaseReconciler) handleDeleting(ctx context.Context, leases []*kleasev1alpha1.GPULease, now time.Time) error {
+	for _, l := range leases {
+		if l.DeletionTimestamp == nil {
+			continue
+		}
+		switch l.Status.State {
+		case kleasev1alpha1.GPULeaseStateActive:
+			// Lost race: the lease was admitted and deleted before the
+			// finalizer sweep ran. Re-acquire the drain right; adding a
+			// finalizer to a deleting object is permitted.
+			if controllerutil.AddFinalizer(l, kleasev1alpha1.FinalizerDrain) {
+				if err := r.Update(ctx, l); err != nil {
+					return err
+				}
+			}
+			// Deletion expires the lease now: the timer is clamped to the
+			// deletion moment so the grace window runs from deletion, not
+			// from the original expiry.
+			clamped := metav1.NewTime(now)
+			deadline := metav1.NewTime(now.Add(gracePeriodOf(l)))
+			l.Status.ExpiresAt = &clamped
+			l.Status.State = kleasev1alpha1.GPULeaseStateDraining
+			l.Status.DrainDeadline = &deadline
+			if err := r.Status().Update(ctx, l); err != nil {
+				return err
+			}
+			r.Recorder.Event(l, "Normal", TransitionDraining,
+				fmt.Sprintf("lease deleted while Active; draining workload (force-delete at %s)",
+					deadline.Time.UTC().Format(time.RFC3339)))
+		case kleasev1alpha1.GPULeaseStateDraining:
+			// completeDrains finishes it; the finalizer comes off at Expired.
+		default:
+			// Pending (never admitted) or Expired: holds nothing.
+			if controllerutil.RemoveFinalizer(l, kleasev1alpha1.FinalizerDrain) {
+				if err := r.Update(ctx, l); err != nil && !apierrors.IsNotFound(err) {
+					return err
+				}
+			}
+		}
+	}
+	return nil
+}
+
 // completeDrains advances Draining leases whose workload has been
 // reclaimed to Expired. A drain is complete when the referenced Deployment
 // is gone or no pods match its selector; leftover pods are force-deleted
@@ -280,6 +361,13 @@ func (r *GPULeaseReconciler) completeDrains(ctx context.Context, leases []*kleas
 		}
 		r.Recorder.Event(l, "Normal", TransitionExpired,
 			"drain complete; workload reclaimed and GPU released")
+		// An Expired lease holds nothing: release the finalizer so a held
+		// deletion can complete.
+		if controllerutil.RemoveFinalizer(l, kleasev1alpha1.FinalizerDrain) {
+			if err := r.Update(ctx, l); err != nil && !apierrors.IsNotFound(err) {
+				return err
+			}
+		}
 	}
 	return nil
 }
