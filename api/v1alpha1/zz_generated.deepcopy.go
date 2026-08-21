@@ -117,6 +117,10 @@ func (in *GPULeaseStatus) DeepCopyInto(out *GPULeaseStatus) {
 		in, out := &in.ExpiresAt, &out.ExpiresAt
 		*out = (*in).DeepCopy()
 	}
+	if in.DrainDeadline != nil {
+		in, out := &in.DrainDeadline, &out.DrainDeadline
+		*out = (*in).DeepCopy()
+	}
 	if in.Conditions != nil {
 		in, out := &in.Conditions, &out.Conditions
 		*out = make([]v1.Condition, len(*in))

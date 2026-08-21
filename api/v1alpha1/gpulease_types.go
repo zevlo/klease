@@ -68,7 +68,9 @@ const (
 	GPULeaseStatePending GPULeaseState = "Pending"
 	// GPULeaseStateActive means the lease currently holds the GPU.
 	GPULeaseStateActive GPULeaseState = "Active"
-	// GPULeaseStateDraining means the lease expired and its workload is being reclaimed.
+	// GPULeaseStateDraining means the lease expired and its workload is being
+	// reclaimed: replicas are driven to 0 and leftover pods are force-deleted
+	// at status.drainDeadline. No new lease is admitted while a drain runs.
 	GPULeaseStateDraining GPULeaseState = "Draining"
 	// GPULeaseStateExpired means the lease is finished and the GPU has been handed off.
 	GPULeaseStateExpired GPULeaseState = "Expired"
@@ -100,6 +102,11 @@ type GPULeaseStatus struct {
 	// expiresAt is activeSince + spec.duration; drain starts when it is reached.
 	// +optional
 	ExpiresAt *metav1.Time `json:"expiresAt,omitempty"`
+
+	// drainDeadline is expiresAt + spec.gracePeriod, stamped when the lease
+	// enters Draining; leftover pods are force-deleted when it is reached.
+	// +optional
+	DrainDeadline *metav1.Time `json:"drainDeadline,omitempty"`
 
 	// queuePosition is the lease's position in the global FIFO queue
 	// (0 for the queue head or the Active lease).

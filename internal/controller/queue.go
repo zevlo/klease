@@ -30,9 +30,14 @@ import (
 // Transition kinds for lease lifecycle events.
 const (
 	TransitionAdmitted = "Admitted"
+	TransitionDraining = "Draining"
 	TransitionExpired  = "Expired"
 	TransitionDemoted  = "Demoted"
 )
+
+// defaultGracePeriod mirrors the CEL default on spec.gracePeriod; it backs
+// leases whose gracePeriod is unset (e.g. written via the fake client).
+const defaultGracePeriod = 5 * time.Minute
 
 // Transition is a lifecycle change computed for a lease during a queue pass.
 type Transition struct {
@@ -45,6 +50,8 @@ type Transition struct {
 type QueueResult struct {
 	// Active is the lease holding the GPU after the pass, or nil if none.
 	Active *kleasev1alpha1.GPULease
+	// Draining lists every lease in the Draining state after the pass.
+	Draining []*kleasev1alpha1.GPULease
 	// Changed lists every lease whose status was mutated, deduplicated.
 	Changed []*kleasev1alpha1.GPULease
 	// Transitions lists lifecycle changes that should emit events.
@@ -53,17 +60,22 @@ type QueueResult struct {
 
 // computeQueue runs the pure scheduling pass over all leases:
 //
-//  1. Expiry: Active leases at or past expiresAt become Expired.
+//  1. Expiry: Active leases at or past expiresAt become Draining, with
+//     drainDeadline = expiresAt + gracePeriod stamped for the reclaim.
 //  2. Single-active: if multiple leases are Active (split brain), the
 //     earliest activeSince wins; the rest are demoted to Pending.
-//  3. Admission: with no Active lease, the FIFO head (creationTimestamp,
-//     tie-broken by namespace then name) whose workload is admissible
-//     becomes Active, with the timer stamped from now — a queued lease
-//     never burns its slot waiting.
+//  3. Admission: with no Active and no Draining lease, the FIFO head
+//     (creationTimestamp, tie-broken by namespace then name) whose
+//     workload is admissible becomes Active, with the timer stamped from
+//     now — a queued lease never burns its slot waiting.
 //  4. Queue positions are recomputed for Pending leases (head = 0).
 //
 // admissible reports whether a lease's workloadRef can run now; leases that
 // are not admissible are skipped without holding the rest of the queue.
+//
+// Draining-to-Expired completion is deliberately outside this pass: it
+// depends on cluster state (pod termination), so the reconciler drives it
+// before invoking computeQueue.
 func computeQueue(leases []*kleasev1alpha1.GPULease, now time.Time, admissible func(*kleasev1alpha1.GPULease) bool) QueueResult {
 	var result QueueResult
 	seen := map[types.NamespacedName]bool{}
@@ -78,7 +90,8 @@ func computeQueue(leases []*kleasev1alpha1.GPULease, now time.Time, admissible f
 		result.Transitions = append(result.Transitions, Transition{Lease: l, Kind: kind, Message: message})
 	}
 
-	// Pass 1: expiry.
+	// Pass 1: expiry. The holder keeps the GPU until its workload is
+	// reclaimed, so expiry starts a drain rather than finishing the lease.
 	for _, l := range leases {
 		if l.Status.State != kleasev1alpha1.GPULeaseStateActive || l.Status.ExpiresAt == nil {
 			continue
@@ -87,10 +100,18 @@ func computeQueue(leases []*kleasev1alpha1.GPULease, now time.Time, admissible f
 			continue
 		}
 		expiredAt := l.Status.ExpiresAt.Time
-		l.Status.State = kleasev1alpha1.GPULeaseStateExpired
+		deadline := metav1.NewTime(expiredAt.Add(gracePeriodOf(l)))
+		l.Status.State = kleasev1alpha1.GPULeaseStateDraining
+		l.Status.DrainDeadline = &deadline
 		changed(l)
-		transition(l, TransitionExpired,
-			fmt.Sprintf("lease expired at %s", expiredAt.UTC().Format(time.RFC3339)))
+		transition(l, TransitionDraining,
+			fmt.Sprintf("lease expired at %s; draining workload (force-delete at %s)",
+				expiredAt.UTC().Format(time.RFC3339), deadline.Time.UTC().Format(time.RFC3339)))
+	}
+	for _, l := range leases {
+		if l.Status.State == kleasev1alpha1.GPULeaseStateDraining {
+			result.Draining = append(result.Draining, l)
+		}
 	}
 
 	// Pass 2: single-active (split-brain resolution).
@@ -115,8 +136,9 @@ func computeQueue(leases []*kleasev1alpha1.GPULease, now time.Time, admissible f
 		actives = actives[:1]
 	}
 
-	// Pass 3: admission.
-	if len(actives) == 0 {
+	// Pass 3: admission. Strict handoff: a Draining lease still owns the
+	// GPU until its workload is reclaimed, so it gates admission too.
+	if len(actives) == 0 && len(result.Draining) == 0 {
 		for _, c := range pendingLeases(leases) {
 			if admissible != nil && !admissible(c) {
 				continue
@@ -188,4 +210,12 @@ func activeRank(l *kleasev1alpha1.GPULease) time.Time {
 		return time.Date(9999, 12, 31, 23, 59, 59, 0, time.UTC)
 	}
 	return l.Status.ActiveSince.Time
+}
+
+// gracePeriodOf returns the lease's grace period, defaulting when unset.
+func gracePeriodOf(l *kleasev1alpha1.GPULease) time.Duration {
+	if l.Spec.GracePeriod != nil {
+		return l.Spec.GracePeriod.Duration
+	}
+	return defaultGracePeriod
 }

@@ -135,22 +135,53 @@ var _ = Describe("computeQueue", func() {
 	})
 
 	Context("expiry", func() {
-		It("expires an Active lease at expiresAt", func() {
+		It("moves an expired Active lease to Draining with the default drain deadline", func() {
 			a := active(lease("a", "default", 0, nil), base.Add(-31*time.Minute))
 			res := computeQueue([]*kleasev1alpha1.GPULease{a}, base.Add(time.Minute), alwaysAdmissible)
 
-			Expect(a.Status.State).To(Equal(kleasev1alpha1.GPULeaseStateExpired))
+			Expect(a.Status.State).To(Equal(kleasev1alpha1.GPULeaseStateDraining))
+			Expect(a.Status.DrainDeadline.Time).To(Equal(a.Status.ExpiresAt.Add(5 * time.Minute))) // nil gracePeriod -> 5m default
 			Expect(res.Active).To(BeNil())
-			Expect(findTransition(res, TransitionExpired).Lease).To(BeIdenticalTo(a))
+			Expect(res.Draining).To(HaveLen(1))
+			Expect(res.Draining[0]).To(BeIdenticalTo(a))
+			Expect(findTransition(res, TransitionDraining).Lease).To(BeIdenticalTo(a))
 		})
 
-		It("admits the next lease in the same pass that expires the holder", func() {
+		It("stamps the drain deadline from spec.gracePeriod when set", func() {
+			a := active(lease("a", "default", 0, func(l *kleasev1alpha1.GPULease) {
+				grace := metav1.Duration{Duration: time.Minute}
+				l.Spec.GracePeriod = &grace
+			}), base.Add(-31*time.Minute))
+			res := computeQueue([]*kleasev1alpha1.GPULease{a}, base.Add(time.Minute), alwaysAdmissible)
+
+			Expect(a.Status.State).To(Equal(kleasev1alpha1.GPULeaseStateDraining))
+			Expect(a.Status.DrainDeadline.Time).To(Equal(a.Status.ExpiresAt.Add(time.Minute)))
+			Expect(res.Draining).To(HaveLen(1))
+		})
+
+		It("does not admit the next lease while the holder is Draining", func() {
 			a := active(lease("a", "default", 0, nil), base.Add(-31*time.Minute))
 			b := lease("b", "default", time.Minute, nil)
 			res := computeQueue([]*kleasev1alpha1.GPULease{a, b}, base.Add(time.Minute), alwaysAdmissible)
 
-			Expect(a.Status.State).To(Equal(kleasev1alpha1.GPULeaseStateExpired))
+			Expect(a.Status.State).To(Equal(kleasev1alpha1.GPULeaseStateDraining))
+			Expect(res.Active).To(BeNil())
+			Expect(b.Status.State).To(Equal(kleasev1alpha1.GPULeaseStatePending))
+			Expect(findTransition(res, TransitionAdmitted)).To(BeNil())
+		})
+
+		It("admits the next lease once the drain completes", func() {
+			a := active(lease("a", "default", 0, nil), base.Add(-31*time.Minute))
+			b := lease("b", "default", time.Minute, nil)
+			computeQueue([]*kleasev1alpha1.GPULease{a, b}, base.Add(time.Minute), alwaysAdmissible)
+
+			// Drain completion (driven by the reconciler) flips Draining to Expired.
+			a.Status.State = kleasev1alpha1.GPULeaseStateExpired
+			res := computeQueue([]*kleasev1alpha1.GPULease{a, b}, base.Add(time.Minute), alwaysAdmissible)
+
 			Expect(res.Active).To(BeIdenticalTo(b))
+			Expect(res.Draining).To(BeEmpty())
+			Expect(findTransition(res, TransitionAdmitted).Lease).To(BeIdenticalTo(b))
 		})
 
 		It("does not expire a lease one second early", func() {

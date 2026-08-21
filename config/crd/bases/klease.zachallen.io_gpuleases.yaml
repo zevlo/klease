@@ -183,6 +183,12 @@ spec:
                 x-kubernetes-list-map-keys:
                 - type
                 x-kubernetes-list-type: map
+              drainDeadline:
+                description: |-
+                  drainDeadline is expiresAt + spec.gracePeriod, stamped when the lease
+                  enters Draining; leftover pods are force-deleted when it is reached.
+                format: date-time
+                type: string
               expiresAt:
                 description: expiresAt is activeSince + spec.duration; drain starts
                   when it is reached.

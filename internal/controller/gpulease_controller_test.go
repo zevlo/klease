@@ -70,6 +70,13 @@ var _ = Describe("GPULease Controller", func() {
 		return types.NamespacedName{Name: name, Namespace: "default"}
 	}
 
+	makePod := func(name, deployName string) *corev1.Pod {
+		return &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default", Labels: map[string]string{"app": deployName}},
+			Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "c", Image: "registry.k8s.io/pause:3.10"}}},
+		}
+	}
+
 	getLease := func(name string) *kleasev1alpha1.GPULease {
 		l := &kleasev1alpha1.GPULease{}
 		ExpectWithOffset(1, k8sClient.Get(ctx, key(name), l)).To(Succeed())
@@ -136,6 +143,42 @@ var _ = Describe("GPULease Controller", func() {
 			l := getLease(leaseName)
 			Expect(l.Status.State).To(Equal(kleasev1alpha1.GPULeaseStateActive))
 			Expect(replicas(deploy)).To(Equal(int32(1)))
+		})
+	})
+
+	Context("drain with a deleted workload", func() {
+		const (
+			leaseName = "vanishing-lease"
+			deploy    = "vanishing-deploy"
+		)
+
+		BeforeEach(func() {
+			Expect(k8sClient.Create(ctx, makeLease(leaseName, deploy, 30*time.Minute))).To(Succeed())
+			Expect(k8sClient.Create(ctx, makeDeployment(deploy, 0, true))).To(Succeed())
+		})
+
+		AfterEach(func() {
+			Expect(k8sClient.Delete(ctx, getLease(leaseName))).To(Succeed())
+			// By reference: the test may have deleted it already.
+			_ = k8sClient.Delete(ctx, &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: deploy, Namespace: "default"}})
+		})
+
+		It("completes the drain immediately when the workload no longer exists", func() {
+			fakeNow := time.Now()
+			r.NowFn = func() time.Time { return fakeNow }
+
+			doReconcile(leaseName) // admits
+
+			// Past expiry, and the workload was deleted out from under the lease.
+			fakeNow = fakeNow.Add(31 * time.Minute)
+			Expect(k8sClient.Delete(ctx, getDeploy(deploy))).To(Succeed())
+
+			doReconcile(leaseName) // expiry pass: Active -> Draining (drain check ran while still Active)
+
+			result := doReconcile(leaseName) // drain check: Deployment gone -> Expired
+
+			Expect(getLease(leaseName).Status.State).To(Equal(kleasev1alpha1.GPULeaseStateExpired))
+			Expect(result.RequeueAfter).To(Equal(time.Duration(0))) // nothing queued, draining, or active
 		})
 	})
 
@@ -242,19 +285,73 @@ var _ = Describe("GPULease Controller", func() {
 			Expect(replicas(depB)).To(Equal(int32(0)))
 		})
 
-		It("hands off at expiry: first Expired, second Active, workloads swap", func() {
+		It("hands off strictly: the successor is admitted only after the drain completes", func() {
 			fakeNow := time.Now()
 			r.NowFn = func() time.Time { return fakeNow }
 
-			doReconcile(second) // steady state under the fake clock
+			doReconcile(second) // admits first, second queued
 
-			// Advance past the holder's expiry and run any lease's reconcile.
+			// A pod of the holder's workload is still running at expiry.
+			pod := makePod("holder-pod", depA)
+			Expect(k8sClient.Create(ctx, pod)).To(Succeed())
+			DeferCleanup(func() {
+				_ = k8sClient.Delete(ctx, pod)
+			})
+
+			// Advance past expiry: holder moves to Draining, its Deployment
+			// scales to 0, and the successor must not be admitted yet.
 			fakeNow = fakeNow.Add(31 * time.Minute)
+			doReconcile(second)
+
+			Expect(getLease(first).Status.State).To(Equal(kleasev1alpha1.GPULeaseStateDraining))
+			Expect(getLease(first).Status.DrainDeadline).NotTo(BeNil())
+			l := getLease(second)
+			Expect(l.Status.State).To(Equal(kleasev1alpha1.GPULeaseStatePending))
+			Expect(replicas(depA)).To(Equal(int32(0)))
+			Expect(replicas(depB)).To(Equal(int32(0)))
+
+			// The pod terminates gracefully before the drain deadline.
+			Expect(k8sClient.Delete(ctx, pod)).To(Succeed())
+
 			doReconcile(second)
 
 			Expect(getLease(first).Status.State).To(Equal(kleasev1alpha1.GPULeaseStateExpired))
 			Expect(getLease(second).Status.State).To(Equal(kleasev1alpha1.GPULeaseStateActive))
 			Expect(replicas(depA)).To(Equal(int32(0)))
+			Expect(replicas(depB)).To(Equal(int32(1)))
+		})
+
+		It("force-deletes stuck pods at the drain deadline", func() {
+			fakeNow := time.Now()
+			r.NowFn = func() time.Time { return fakeNow }
+
+			doReconcile(second) // admits first
+
+			stuck := makePod("stuck-pod", depA)
+			Expect(k8sClient.Create(ctx, stuck)).To(Succeed())
+			DeferCleanup(func() {
+				_ = k8sClient.Delete(ctx, stuck)
+			})
+
+			// Past expiry but within the 5m default grace: Draining, pod untouched.
+			fakeNow = fakeNow.Add(31 * time.Minute)
+			doReconcile(second)
+
+			Expect(getLease(first).Status.State).To(Equal(kleasev1alpha1.GPULeaseStateDraining))
+			Expect(k8sClient.Get(ctx, key("stuck-pod"), &corev1.Pod{})).To(Succeed())
+
+			// Past the drain deadline: stragglers force-deleted, lease still
+			// Draining this pass; completion lands next pass.
+			fakeNow = fakeNow.Add(10 * time.Minute)
+			doReconcile(second)
+
+			Expect(getLease(first).Status.State).To(Equal(kleasev1alpha1.GPULeaseStateDraining))
+			Expect(k8sClient.Get(ctx, key("stuck-pod"), &corev1.Pod{})).To(HaveOccurred())
+
+			doReconcile(second)
+
+			Expect(getLease(first).Status.State).To(Equal(kleasev1alpha1.GPULeaseStateExpired))
+			Expect(getLease(second).Status.State).To(Equal(kleasev1alpha1.GPULeaseStateActive))
 			Expect(replicas(depB)).To(Equal(int32(1)))
 		})
 

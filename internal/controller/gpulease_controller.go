@@ -22,6 +22,7 @@ import (
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -44,9 +45,12 @@ const (
 	// also drives promotion after an Active lease is deleted with no other
 	// trigger, and retries admission for leases with missing workloads.
 	pendingRequeue = 30 * time.Second
-	// minExpiryRequeue clamps the Active requeue so a lease expiring right
-	// now schedules a small positive delay instead of zero or negative.
-	minExpiryRequeue = time.Second
+	// drainPollInterval caps the requeue while a drain is in progress so
+	// graceful pod termination is noticed well before the deadline.
+	drainPollInterval = 5 * time.Second
+	// minRequeueDelay clamps requeues so a timer firing right now still
+	// schedules a small positive delay instead of zero or negative.
+	minRequeueDelay = time.Second
 )
 
 // GPULeaseReconciler reconciles a GPULease object.
@@ -66,6 +70,7 @@ type GPULeaseReconciler struct {
 // +kubebuilder:rbac:groups=klease.zachallen.io,resources=gpuleases/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=klease.zachallen.io,resources=gpuleases/finalizers,verbs=update
 // +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;update;patch
+// +kubebuilder:rbac:groups=core,resources=pods,verbs=get;list;watch;delete
 // +kubebuilder:rbac:groups=core,resources=events,verbs=create;patch
 
 // Reconcile drives the cluster toward the lease queue's desired state:
@@ -74,9 +79,13 @@ type GPULeaseReconciler struct {
 //   - The active holder's workloadRef scaled to 1
 //   - Every other managed Deployment scaled to 0 — drift of any kind
 //     (manual scale-ups, pre-existing pods) is corrected every pass
+//   - Expired holders drain before the next lease is admitted: the lease
+//     goes Draining until its pods are gone (force-deleted at
+//     drainDeadline), then Expired hands the GPU to the queue head
 //
-// The Active lease requeues at its expiry; Pending leases requeue on a
-// safety-net cadence so promotion never waits on an external event.
+// The Active lease requeues at its expiry; a Draining lease requeues on a
+// poll capped by its drain deadline; Pending leases requeue on a safety-net
+// cadence so promotion never waits on an external event.
 func (r *GPULeaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := log.FromContext(ctx).WithValues("gpulease", req.NamespacedName)
 	now := r.now()
@@ -93,6 +102,12 @@ func (r *GPULeaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 
 	// Maintain WorkloadNotFound conditions; they gate admission.
 	if err := r.maintainWorkloadConditions(ctx, leases); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	// Finish drains first so a lease completing in this pass releases the
+	// GPU for admission below in the same reconcile.
+	if err := r.completeDrains(ctx, leases, now); err != nil {
 		return ctrl.Result{}, err
 	}
 
@@ -118,12 +133,24 @@ func (r *GPULeaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	}
 
 	// Requeue against global state, not just the requested lease: whoever's
-	// reconcile admitted a lease must carry the next expiry timer.
+	// reconcile admitted a lease must carry the next expiry timer, and a
+	// drain in progress must carry its deadline.
 	switch {
 	case result.Active != nil && result.Active.Status.ExpiresAt != nil:
-		d := result.Active.Status.ExpiresAt.Time.Sub(now)
-		if d < minExpiryRequeue {
-			d = minExpiryRequeue
+		d := max(result.Active.Status.ExpiresAt.Sub(now), minRequeueDelay)
+		return ctrl.Result{RequeueAfter: d}, nil
+	case len(result.Draining) > 0:
+		d := drainPollInterval
+		for _, l := range result.Draining {
+			if l.Status.DrainDeadline == nil {
+				continue // missing stamp: force-delete path, poll now
+			}
+			if wait := l.Status.DrainDeadline.Sub(now); wait < d {
+				d = wait
+			}
+		}
+		if d < minRequeueDelay {
+			d = minRequeueDelay
 		}
 		return ctrl.Result{RequeueAfter: d}, nil
 	case len(pendingLeases(leases)) > 0:
@@ -229,6 +256,69 @@ func (r *GPULeaseReconciler) enforceInvariant(ctx context.Context, active *kleas
 		}
 	}
 	return nil
+}
+
+// completeDrains advances Draining leases whose workload has been
+// reclaimed to Expired. A drain is complete when the referenced Deployment
+// is gone or no pods match its selector; leftover pods are force-deleted
+// once the drain deadline passes, with completion confirmed next pass.
+func (r *GPULeaseReconciler) completeDrains(ctx context.Context, leases []*kleasev1alpha1.GPULease, now time.Time) error {
+	for _, l := range leases {
+		if l.Status.State != kleasev1alpha1.GPULeaseStateDraining {
+			continue
+		}
+		done, err := r.drainStep(ctx, l, now)
+		if err != nil {
+			return err
+		}
+		if !done {
+			continue
+		}
+		l.Status.State = kleasev1alpha1.GPULeaseStateExpired
+		if err := r.Status().Update(ctx, l); err != nil {
+			return err
+		}
+		r.Recorder.Event(l, "Normal", TransitionExpired,
+			"drain complete; workload reclaimed and GPU released")
+	}
+	return nil
+}
+
+// drainStep performs one progress check on a Draining lease, force-deleting
+// stragglers once the deadline is reached. It reports whether the drain is
+// complete.
+func (r *GPULeaseReconciler) drainStep(ctx context.Context, l *kleasev1alpha1.GPULease, now time.Time) (bool, error) {
+	deploy := &appsv1.Deployment{}
+	err := r.Get(ctx, types.NamespacedName{Namespace: l.Namespace, Name: l.Spec.WorkloadRef.Name}, deploy)
+	if apierrors.IsNotFound(err) {
+		return true, nil
+	}
+	if err != nil {
+		return false, err
+	}
+
+	pods := &corev1.PodList{}
+	if err := r.List(ctx, pods,
+		client.InNamespace(deploy.Namespace),
+		client.MatchingLabels(deploy.Spec.Selector.MatchLabels)); err != nil {
+		return false, err
+	}
+	if len(pods.Items) == 0 {
+		return true, nil
+	}
+	if l.Status.DrainDeadline != nil && now.Before(l.Status.DrainDeadline.Time) {
+		return false, nil
+	}
+
+	for i := range pods.Items {
+		if err := r.Delete(ctx, &pods.Items[i], client.GracePeriodSeconds(0)); err != nil && !apierrors.IsNotFound(err) {
+			return false, err
+		}
+	}
+	r.Recorder.Eventf(l, "Warning", "ForceDrain",
+		"grace period exceeded; force-deleted %d Pod(s) of %s %s/%s",
+		len(pods.Items), l.Spec.WorkloadRef.Kind, l.Namespace, l.Spec.WorkloadRef.Name)
+	return false, nil
 }
 
 func conditionTrue(l *kleasev1alpha1.GPULease, condType string) bool {
