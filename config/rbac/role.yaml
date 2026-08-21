@@ -1,0 +1,32 @@
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: manager-role
+rules:
+- apiGroups:
+  - klease.zachallen.io
+  resources:
+  - gpuleases
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - klease.zachallen.io
+  resources:
+  - gpuleases/finalizers
+  verbs:
+  - update
+- apiGroups:
+  - klease.zachallen.io
+  resources:
+  - gpuleases/status
+  verbs:
+  - get
+  - patch
+  - update

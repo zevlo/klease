@@ -1,0 +1,13 @@
+apiVersion: klease.zachallen.io/v1alpha1
+kind: GPULease
+metadata:
+  labels:
+    app.kubernetes.io/name: klease
+    app.kubernetes.io/managed-by: kustomize
+  name: vllm-turn
+spec:
+  workloadRef: # pointer, NOT a pod template
+    kind: Deployment # MVP: Deployment only
+    name: vllm-server # same namespace as the lease
+  duration: 30m # timer starts at admission, not creation
+  gracePeriod: 5m # drain deadline before force-delete
