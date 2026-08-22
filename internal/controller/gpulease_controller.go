@@ -143,7 +143,13 @@ func (r *GPULeaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	for _, t := range result.Transitions {
 		logger.Info("lease transition", "lease", types.NamespacedName{Namespace: t.Lease.Namespace, Name: t.Lease.Name}, "kind", t.Kind)
 		r.Recorder.Event(t.Lease, "Normal", t.Kind, t.Message)
+		if t.Kind == TransitionAdmitted {
+			observeAdmissionWait(t.Lease)
+		}
 	}
+
+	// Level-triggered queue gauges after the pass settles.
+	setQueueGauges(result.Active, len(pendingLeases(queueInput)))
 
 	// Finalizer sweep: any lease that may hold the GPU carries the drain
 	// finalizer, so deletion cannot bypass the drain. Adding a finalizer
@@ -361,6 +367,9 @@ func (r *GPULeaseReconciler) completeDrains(ctx context.Context, leases []*kleas
 		}
 		r.Recorder.Event(l, "Normal", TransitionExpired,
 			"drain complete; workload reclaimed and GPU released")
+		if l.Status.ExpiresAt != nil {
+			observeDrainDuration(l.Status.ExpiresAt.Time, now)
+		}
 		// An Expired lease holds nothing: release the finalizer so a held
 		// deletion can complete.
 		if controllerutil.RemoveFinalizer(l, kleasev1alpha1.FinalizerDrain) {
