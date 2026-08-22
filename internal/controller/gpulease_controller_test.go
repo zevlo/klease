@@ -39,6 +39,8 @@ const (
 	testNamespace = "default"
 	// appLabelKey is the selector label shared by test workloads.
 	appLabelKey = "app"
+	// pauseImage is the inert container used by test workloads.
+	pauseImage = "registry.k8s.io/pause:3.10"
 )
 
 var _ = Describe("GPULease Controller", func() {
@@ -69,7 +71,7 @@ var _ = Describe("GPULease Controller", func() {
 				Selector: &metav1.LabelSelector{MatchLabels: map[string]string{appLabelKey: name}},
 				Template: corev1.PodTemplateSpec{
 					ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{appLabelKey: name}},
-					Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "c", Image: "registry.k8s.io/pause:3.10"}}},
+					Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "c", Image: pauseImage}}},
 				},
 			},
 		}

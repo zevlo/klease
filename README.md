@@ -1,121 +1,158 @@
 # klease
-// TODO(user): Add simple overview of use/purpose
 
-## Description
-// TODO(user): An in-depth paragraph about your project and overview of use
+klease is a Kubernetes operator that lets workloads take turns using a shared GPU.
 
-## Getting Started
+Instead of fighting over who owns the accelerator, you label the GPU Deployment as managed, and each team (or job) creates a `GPULease` that reserves a time slot. klease runs the queue for you: the holder's Deployment is scaled to 1 for the duration of its lease, everyone else's stays at 0, and expired holders are drained before the next lease starts.
 
-### Prerequisites
-- go version v1.24.6+
-- docker version 17.03+.
-- kubectl version v1.11.3+.
-- Access to a Kubernetes v1.11.3+ cluster.
+## How it works
 
-### To Deploy on the cluster
-**Build and push your image to the location specified by `IMG`:**
+A `GPULease` points at an existing Deployment — it never creates or modifies pods itself:
 
-```sh
-make docker-build docker-push IMG=<some-registry>/klease:tag
+```yaml
+apiVersion: klease.zachallen.io/v1alpha1
+kind: GPULease
+metadata:
+  name: my-turn
+spec:
+  workloadRef:
+    kind: Deployment
+    name: vllm-server
+  duration: 2h      # how long you hold the GPU once admitted
+  gracePeriod: 5m   # how long your workload gets to shut down cleanly
 ```
 
-**NOTE:** This image ought to be published in the personal registry you specified.
-And it is required to have access to pull the image from the working environment.
-Make sure you have the proper permission to the registry if the above commands don’t work.
+The lease moves through four states:
 
-**Install the CRDs into the cluster:**
+```
+Pending → Active → Draining → Expired
+```
+
+- **Pending** — queued. Leases are admitted first-come, first-served (by creation time). The clock starts at admission, not creation: waiting in line never burns your slot.
+- **Active** — your Deployment is scaled to 1 and holds the GPU until `expiresAt`.
+- **Draining** — your slot ended. The Deployment is scaled to 0 and klease waits for your pods to exit. If they are still running when `gracePeriod` elapses, they are force-deleted.
+- **Expired** — done. The next lease in line is admitted only after your workload is fully drained, so two workloads never touch the GPU at the same time.
+
+Deleting an Active lease follows the same path: the object sticks around (held by a finalizer) until the drain finishes, so deleting a lease never strands pods on the GPU.
+
+### The managed-label contract
+
+klease only touches Deployments labeled:
+
+```yaml
+klease.zachallen.io/managed: "true"
+```
+
+The rule is simple: a managed Deployment runs **exactly one replica when its lease is Active, zero replicas at every other time** — including manual scale-ups, which are reverted automatically. Unlabeled Deployments are ignored entirely.
+
+If a lease points at a Deployment that is missing or not labeled, the lease stays Pending with a `WorkloadNotFound` condition and is admitted as soon as the target appears.
+
+## Getting started
+
+Prerequisites: a Kubernetes 1.30+ cluster, `kubectl`, and access to a container registry if deploying from source.
+
+**Install the operator:**
 
 ```sh
+# Build and push the manager image
+make docker-build docker-push IMG=<registry>/klease:v0.1.0
+
+# Install CRDs and deploy the manager
 make install
+make deploy IMG=<registry>/klease:v0.1.0
 ```
 
-**Deploy the Manager to the cluster with the image specified by `IMG`:**
+**Put a workload under lease arbitration:**
 
 ```sh
-make deploy IMG=<some-registry>/klease:tag
+kubectl label deployment vllm-server klease.zachallen.io/managed=true
+kubectl scale deployment vllm-server --replicas=0
 ```
 
-> **NOTE**: If you encounter RBAC errors, you may need to grant yourself cluster-admin
-privileges or be logged in as admin.
+> The label alone is enough — on the next reconcile klease parks the Deployment at 0 replicas until a lease holds it.
 
-**Create instances of your solution**
-You can apply the samples (examples) from the config/sample:
+**Take a turn:**
 
 ```sh
-kubectl apply -k config/samples/
+kubectl apply -f - <<'EOF'
+apiVersion: klease.zachallen.io/v1alpha1
+kind: GPULease
+metadata:
+  name: my-turn
+spec:
+  workloadRef:
+    kind: Deployment
+    name: vllm-server
+  duration: 2h
+EOF
 ```
 
->**NOTE**: Ensure that the samples has default values to test it out.
-
-### To Uninstall
-**Delete the instances (CRs) from the cluster:**
+**Watch the queue:**
 
 ```sh
-kubectl delete -k config/samples/
+kubectl get gpuleases     # short name: gl
 ```
 
-**Delete the APIs(CRDs) from the cluster:**
+```
+NAME      STATE     WORKLOAD       DURATION   EXPIRES                AGE
+my-turn   Active    vllm-server    2h         2026-08-22T14:00:00Z   5m
+next-up   Pending   vllm-server    1h                                2m
+```
+
+Events on each lease (`kubectl describe gpulease my-turn`) show every transition: `Admitted`, `Draining`, `Expired`.
+
+### Changing a lease
+
+- **Extend or shorten your slot**: edit `spec.duration` on an Active lease — `expiresAt` moves accordingly (shortening past the current time ends the slot).
+- **Adjust shutdown time**: edit `spec.gracePeriod`, even while Draining.
+- **Point elsewhere**: `workloadRef` is immutable. Delete the lease and create a new one.
+
+### Spec reference
+
+| Field | Description |
+|---|---|
+| `workloadRef.kind` | Must be `Deployment` |
+| `workloadRef.name` | Deployment in the lease's namespace |
+| `duration` | Slot length once admitted (`1s`–`24h`) |
+| `gracePeriod` | Drain budget after expiry before force-delete (default `5m`, must not exceed `duration`) |
+
+### Status reference
+
+| Field | Description |
+|---|---|
+| `state` | `Pending`, `Active`, `Draining`, or `Expired` |
+| `activeSince` / `expiresAt` | Slot start and end (timer starts at admission) |
+| `drainDeadline` | Force-delete cutoff while Draining |
+| `queuePosition` | Place in line (0 = head) |
+| `conditions` | `WorkloadNotFound` when the target is missing or not managed |
+
+## Metrics
+
+The manager's metrics endpoint (HTTPS, authn/authz-protected by default) exposes:
+
+| Metric | Type | Meaning |
+|---|---|---|
+| `klease_queue_depth` | gauge | Leases waiting for the GPU |
+| `klease_active_leases` | gauge | Current holder (0 or 1) |
+| `klease_admission_wait_seconds` | histogram | Wait from lease creation to admission |
+| `klease_drain_duration_seconds` | histogram | Time from expiry to workload fully reclaimed |
+
+## Uninstall
 
 ```sh
+kubectl delete gpuleases -A           # drains any holder first
+make undeploy
 make uninstall
 ```
 
-**UnDeploy the controller from the cluster:**
+## Development
 
 ```sh
-make undeploy
+make test        # unit + envtest suite
+make test-e2e    # full lifecycle on an isolated Kind cluster
+make lint        # golangci-lint
 ```
 
-## Project Distribution
-
-Following the options to release and provide this solution to the users.
-
-### By providing a bundle with all YAML files
-
-1. Build the installer for the image built and published in the registry:
-
-```sh
-make build-installer IMG=<some-registry>/klease:tag
-```
-
-**NOTE:** The makefile target mentioned above generates an 'install.yaml'
-file in the dist directory. This file contains all the resources built
-with Kustomize, which are necessary to install this project without its
-dependencies.
-
-2. Using the installer
-
-Users can just run 'kubectl apply -f <URL for YAML BUNDLE>' to install
-the project, i.e.:
-
-```sh
-kubectl apply -f https://raw.githubusercontent.com/<org>/klease/<tag or branch>/dist/install.yaml
-```
-
-### By providing a Helm Chart
-
-1. Build the chart using the optional helm plugin
-
-```sh
-kubebuilder edit --plugins=helm/v2-alpha
-```
-
-2. See that a chart was generated under 'dist/chart', and users
-can obtain this solution from there.
-
-**NOTE:** If you change the project, you need to update the Helm Chart
-using the same command above to sync the latest changes. Furthermore,
-if you create webhooks, you need to use the above command with
-the '--force' flag and manually ensure that any custom configuration
-previously added to 'dist/chart/values.yaml' or 'dist/chart/manager/manager.yaml'
-is manually re-applied afterwards.
-
-## Contributing
-// TODO(user): Add detailed information on how you would like others to contribute to this project
-
-**NOTE:** Run `make help` for more information on all potential `make` targets
-
-More information can be found via the [Kubebuilder Documentation](https://book.kubebuilder.io/introduction.html)
+See [AGENTS.md](AGENTS.md) for repository layout and conventions.
 
 ## License
 
@@ -132,4 +169,3 @@ distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
-
