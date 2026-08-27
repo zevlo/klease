@@ -156,7 +156,7 @@ See [AGENTS.md](AGENTS.md) for repository layout and conventions.
 
 ## License
 
-Copyright 2026.
+Copyright 2026 Zachary Allen.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
